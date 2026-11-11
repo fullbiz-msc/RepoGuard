@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('audit', Path(__file__).resolve().parents[1] / 'project_audit.py')
 audit = importlib.util.module_from_spec(spec)
@@ -12,6 +13,55 @@ spec.loader.exec_module(audit)
 
 
 class AuditTests(unittest.TestCase):
+    def test_env_is_not_opened_without_consent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ('.env', '.env.production', '.env.example', 'service.env', '.ENV.local'):
+                (root / name).write_text('password = "sensitive-env-value"\n')
+            with patch.object(audit.os, 'open', side_effect=AssertionError('File opened without consent')):
+                report = audit.scan(root)
+            self.assertEqual(report['files'], [])
+            self.assertEqual(len(report['env_access']), 5)
+            self.assertTrue(all(not entry['approved'] for entry in report['env_access']))
+            self.assertEqual(len(report['skipped']), 5)
+
+    def test_env_consent_is_per_file_and_secrets_are_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.env').write_text('password = "sensitive-env-value"\n')
+            (root / '.env.production').write_text('password = "private-production-value"\n')
+            requested = []
+            def consent(path):
+                requested.append(path)
+                return path == '.env'
+            report = audit.scan(root, env_approval=consent)
+            self.assertEqual(requested, ['.env', '.env.production'])
+            self.assertEqual([item['path'] for item in report['files']], ['.env'])
+            self.assertEqual([item['path'] for item in report['findings']], ['.env'])
+            self.assertNotIn('sensitive-env-value', str(report))
+            self.assertNotIn('private-production-value', audit.markdown(report))
+
+    def test_terminal_confirmation_requires_explicit_yes(self):
+        for answer, expected in (('да', True), ('yes', True), ('нет', False), ('', False), ('maybe', False)):
+            with self.subTest(answer=answer), patch.object(audit.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value=answer):
+                self.assertEqual(audit.request_env_access('.env'), expected)
+        with patch.object(audit.sys.stdin, 'isatty', return_value=False), patch('builtins.input', side_effect=AssertionError('Must not prompt')):
+            self.assertFalse(audit.request_env_access('.env'))
+        with patch.object(audit.sys.stdin, 'isatty', return_value=True), patch('builtins.input', side_effect=EOFError):
+            self.assertFalse(audit.request_env_access('.env'))
+
+    def test_noninteractive_cli_reports_unchecked_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'project'
+            root.mkdir()
+            (root / '.env').write_text('password = "sensitive-env-value"\n')
+            result = subprocess.run([sys.executable, str(Path(audit.__file__)), str(root), '--output', str(Path(tmp) / 'report')], input=b'', capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            report = (Path(tmp) / 'report/SECURITY-REPORT.md').read_text()
+            self.assertIn('env access not approved', report)
+            self.assertNotIn('sensitive-env-value', report)
+            self.assertIn('env без согласия: 1', result.stdout.decode())
+
     def test_cli_output_boundary_and_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

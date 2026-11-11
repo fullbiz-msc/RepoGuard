@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 
 SKIP = {'.git', '.venv', 'venv', 'node_modules', 'vendor', '__pycache__', 'dist', 'build', '.next'}
 EXTENSIONS = {'.py', '.js', '.jsx', '.ts', '.tsx', '.json', '.yaml', '.yml', '.toml', '.ini', '.conf', '.env', '.php', '.rb', '.go', '.java', '.cs', '.sh', '.sql'}
@@ -26,11 +27,28 @@ SECRET_ASSIGN = re.compile(r'''(?i)\b(?:api[_-]?key|secret[_-]?key|access[_-]?to
 SECRET_TOKEN = re.compile(r'\b(?:AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36})\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----')
 
 
-def scan(root):
+def is_env_file(path):
+    name = Path(path).name.lower()
+    return name.startswith('.env') or name.endswith('.env')
+
+
+def request_env_access(relative):
+    if not sys.stdin.isatty():
+        return False
+    # repr escapes control characters from untrusted filenames in the prompt.
+    try:
+        answer = input(f'Разрешить чтение env-файла {relative!r} для анализа? '
+                       'Значения не попадут в отчёт. [да/нет, по умолчанию нет]: ')
+    except EOFError:
+        return False
+    return answer.strip().lower() in {'да', 'д', 'yes', 'y'}
+
+
+def scan(root, *, env_approval=None):
     root = Path(root).resolve(strict=True)
     if not root.is_dir():
         raise ValueError('Цель должна быть каталогом')
-    findings, files, skipped, errors = [], [], [], []
+    findings, files, skipped, errors, env_access = [], [], [], [], []
     for current, directories, names in os.walk(root, followlinks=False):
         kept = []
         for name in sorted(directories):
@@ -46,7 +64,13 @@ def scan(root):
             if path.is_symlink():
                 skipped.append({'path': relative, 'reason': 'symlink'})
                 continue
-            if path.suffix.lower() not in EXTENSIONS and not name.startswith('.env') and name != 'Dockerfile':
+            if is_env_file(path):
+                allowed = env_approval is not None and env_approval(relative) is True
+                env_access.append({'path': relative, 'approved': allowed})
+                if not allowed:
+                    skipped.append({'path': relative, 'reason': 'env access not approved; configuration not checked'})
+                    continue
+            if path.suffix.lower() not in EXTENSIONS and not is_env_file(path) and name != 'Dockerfile':
                 skipped.append({'path': relative, 'reason': 'unsupported file type'})
                 continue
             try:
@@ -85,7 +109,7 @@ def scan(root):
                     ast.parse(content)
                 except (SyntaxError, ValueError, RecursionError):
                     errors.append({'path': relative, 'reason': 'Python syntax could not be parsed; lexical results only'})
-    return {'schema_version': 1, 'mode': 'offline-static-triage', 'root': str(root), 'findings': findings, 'files': files, 'skipped': skipped, 'errors': errors, 'limitations': ['Все находки — кандидаты для ручной проверки, а не подтверждённые уязвимости.', 'Код, тесты, зависимости и сервисы не запускались; сеть не использовалась.', 'CVE и актуальные версии зависимостей не проверялись.', 'Правила не анализируют потоки данных, авторизацию, бизнес-логику платежей и все языковые конструкции.', 'Проверка не доказывает отсутствие уязвимостей. Используйте неизменяемую копию исходников для защиты от конкурентной подмены файлов.']}
+    return {'schema_version': 1, 'mode': 'offline-static-triage', 'root': str(root), 'findings': findings, 'files': files, 'skipped': skipped, 'errors': errors, 'env_access': env_access, 'limitations': ['Все находки — кандидаты для ручной проверки, а не подтверждённые уязвимости.', 'Env-файлы читаются только после отдельного согласия; отказ или отсутствие ответа означает непроверенную конфигурацию.', 'Код, тесты, зависимости и сервисы не запускались; сеть не использовалась.', 'CVE и актуальные версии зависимостей не проверялись.', 'Правила не анализируют потоки данных, авторизацию, бизнес-логику платежей и все языковые конструкции.', 'Проверка не доказывает отсутствие уязвимостей. Используйте неизменяемую копию исходников для защиты от конкурентной подмены файлов.']}
 
 
 def finding(rule, severity, path, line, title, fix, impact):
@@ -120,13 +144,14 @@ def main():
     if output.exists():
         parser.error('--output уже существует; выберите новый каталог, чтобы сохранить прежние отчёты')
     try:
-        report = scan(root)
+        report = scan(root, env_approval=request_env_access)
         output.mkdir(parents=True, exist_ok=False)
         (output / 'SECURITY-REPORT.md').write_text(markdown(report), encoding='utf-8')
         (output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, EOFError, KeyboardInterrupt) as exc:
         parser.exit(2, f'Аудит не завершён: {type(exc).__name__}\n')
-    print(f"Кандидатов: {len(report['findings'])}; ошибок: {len(report['errors'])}. Отчёт: {output / 'SECURITY-REPORT.md'}")
+    env_skipped = sum(not item['approved'] for item in report['env_access'])
+    print(f"Кандидатов: {len(report['findings'])}; ошибок: {len(report['errors'])}; env без согласия: {env_skipped}. Отчёт: {output / 'SECURITY-REPORT.md'}")
     return 2 if report['errors'] else 1 if report['findings'] else 0
 
 
